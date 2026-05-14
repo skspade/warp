@@ -2771,6 +2771,18 @@ pub struct TerminalView {
     #[cfg(feature = "local_fs")]
     git_repo_status: Option<ModelHandle<GitRepoStatusModel>>,
 
+    /// Repo path detected from the CLI agent's reported cwd, distinct from
+    /// `current_repo_path` (driven by shell navigation). Populated while an
+    /// agent session is active and its cwd resolves to a git repo.
+    #[cfg(feature = "local_fs")]
+    cli_agent_repo_path: Option<PathBuf>,
+
+    /// Per-repo git status model for the CLI agent's repo, if any. Independent
+    /// of `git_repo_status` so the shell-driven badge stays responsive even when
+    /// the agent's cwd points elsewhere.
+    #[cfg(feature = "local_fs")]
+    cli_agent_git_repo_status: Option<ModelHandle<GitRepoStatusModel>>,
+
     /// Deferred code review open request, stashed when [`GitDeltaPreference::OnlyDirty`] is
     /// requested but git status metadata has not loaded yet. Consumed in
     /// [`Self::handle_git_repo_status_event`].
@@ -4252,6 +4264,10 @@ impl TerminalView {
             #[cfg(feature = "local_fs")]
             git_repo_status: None,
             #[cfg(feature = "local_fs")]
+            cli_agent_repo_path: None,
+            #[cfg(feature = "local_fs")]
+            cli_agent_git_repo_status: None,
+            #[cfg(feature = "local_fs")]
             deferred_code_review_open: None,
             block_completed_callbacks: Default::default(),
             conversation_completed_callbacks: Default::default(),
@@ -4768,6 +4784,17 @@ impl TerminalView {
             .and_then(|h| h.as_ref(ctx).metadata())
     }
 
+    /// Helper to read metadata from the CLI agent's per-repo sub-model.
+    #[cfg(feature = "local_fs")]
+    pub(crate) fn cli_agent_git_status_metadata<'a>(
+        &'a self,
+        ctx: &'a AppContext,
+    ) -> Option<&'a GitStatusMetadata> {
+        self.cli_agent_git_repo_status
+            .as_ref()
+            .and_then(|h| h.as_ref(ctx).metadata())
+    }
+
     /// Returns whether this terminal view should subscribe to git status
     /// updates. We subscribe when:
     /// 1. Agent mode is active and its chip list includes `GitDiffStats`, or
@@ -4835,6 +4862,77 @@ impl TerminalView {
         } else if self.git_repo_status.is_some() {
             self.clear_git_repo_status_subscription(ctx);
         }
+    }
+
+    /// Refresh the CLI-agent-side repo detection + git status subscription based
+    /// on the agent's currently reported cwd. Mirrors the shell-driven flow in
+    /// `update_git_status_subscription` but is parameterized by the cwd carried
+    /// in `CLIAgentSessionContext` rather than the shell's most recent prompt
+    /// cycle, so the branch badge tracks long-running agents that `cd` into
+    /// worktrees on different branches.
+    #[cfg(not(feature = "local_fs"))]
+    fn update_cli_agent_repo_subscription(
+        &mut self,
+        _event: &CLIAgentSessionsModelEvent,
+        _ctx: &mut ViewContext<Self>,
+    ) {
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn update_cli_agent_repo_subscription(
+        &mut self,
+        event: &CLIAgentSessionsModelEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if event.terminal_view_id() != self.view_id {
+            return;
+        }
+
+        let cwd = match event {
+            CLIAgentSessionsModelEvent::Ended { .. } => None,
+            _ => CLIAgentSessionsModel::as_ref(ctx)
+                .session(self.view_id)
+                .and_then(|s| s.session_context.cwd.clone())
+                .filter(|cwd| !cwd.trim().is_empty()),
+        };
+
+        let Some(cwd) = cwd else {
+            if self.cli_agent_repo_path.is_some() || self.cli_agent_git_repo_status.is_some() {
+                self.cli_agent_repo_path = None;
+                self.cli_agent_git_repo_status = None;
+                ctx.notify();
+            }
+            return;
+        };
+
+        let fut = DetectedRepositories::handle(ctx).update(ctx, |updater, ctx| {
+            updater.detect_possible_git_repo(&cwd, RepoDetectionSource::TerminalNavigation, ctx)
+        });
+
+        ctx.spawn(fut, move |me, repo_path_opt, ctx| {
+            if me.cli_agent_repo_path == repo_path_opt {
+                return;
+            }
+            me.cli_agent_repo_path = repo_path_opt.clone();
+            me.cli_agent_git_repo_status = None;
+
+            if let Some(repo_path) = repo_path_opt {
+                let result = GitStatusUpdateModel::handle(ctx)
+                    .update(ctx, |model, ctx| model.subscribe(&repo_path, ctx));
+                match result {
+                    Ok(handle) => {
+                        ctx.subscribe_to_model(&handle, |_, _, _, ctx| {
+                            ctx.notify();
+                        });
+                        me.cli_agent_git_repo_status = Some(handle);
+                    }
+                    Err(err) => {
+                        log::warn!("CLI agent GitStatusUpdateModel subscribe failed: {err}");
+                    }
+                }
+            }
+            ctx.notify();
+        });
     }
 
     fn handle_ai_controller_event(
@@ -12311,6 +12409,7 @@ impl TerminalView {
             )
         {
             self.update_pane_configuration(ctx);
+            self.update_cli_agent_repo_subscription(event, ctx);
             ctx.notify();
         }
 

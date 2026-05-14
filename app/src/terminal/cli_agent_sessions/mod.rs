@@ -404,6 +404,8 @@ impl CLIAgentSessionsModel {
         };
 
         let event_type = &event.event;
+        let prev_cwd = session.session_context.cwd.clone();
+
         if let Some(new_status) = session.apply_event(event) {
             let agent = session.agent;
             ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
@@ -414,12 +416,15 @@ impl CLIAgentSessionsModel {
             });
         }
 
-        if matches!(
+        let cwd_changed = session.session_context.cwd != prev_cwd;
+        let known_session_update_event = matches!(
             event_type,
             CLIAgentEventType::SessionStart
                 | CLIAgentEventType::PromptSubmit
                 | CLIAgentEventType::ToolComplete
-        ) {
+        );
+
+        if cwd_changed || known_session_update_event {
             ctx.emit(CLIAgentSessionsModelEvent::SessionUpdated {
                 terminal_view_id,
                 agent: session.agent,

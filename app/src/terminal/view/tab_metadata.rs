@@ -1,7 +1,12 @@
 use crate::context_chips::display_chip::GitLineChanges;
 use crate::context_chips::{git_line_changes_from_chips, ContextChipKind};
+use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::TerminalView;
-use warpui::AppContext;
+use warpui::{AppContext, SingletonEntity};
+
+#[cfg(test)]
+#[path = "tab_metadata_tests.rs"]
+mod tests;
 
 impl TerminalView {
     fn prompt_chip_value(&self, chip_kind: &ContextChipKind, ctx: &AppContext) -> Option<String> {
@@ -12,9 +17,21 @@ impl TerminalView {
             .filter(|value| !value.trim().is_empty())
     }
 
+    /// The cwd reported by an active CLI agent session for this terminal, if any.
+    /// CLI agents may change directories within a long-running child process; the
+    /// shell prompt cycle does not observe those changes, so the agent's reported
+    /// cwd is preferred when present.
+    fn cli_agent_cwd(&self, ctx: &AppContext) -> Option<String> {
+        CLIAgentSessionsModel::as_ref(ctx)
+            .session(self.id())
+            .and_then(|session| session.session_context.cwd.clone())
+            .filter(|cwd| !cwd.trim().is_empty())
+    }
+
     pub fn display_working_directory(&self, ctx: &AppContext) -> Option<String> {
         let raw = self
-            .prompt_chip_value(&ContextChipKind::WorkingDirectory, ctx)
+            .cli_agent_cwd(ctx)
+            .or_else(|| self.prompt_chip_value(&ContextChipKind::WorkingDirectory, ctx))
             .or_else(|| self.pwd())?;
         let home_dir = self
             .active_block_session_id()
@@ -34,6 +51,17 @@ impl TerminalView {
 
     #[cfg_attr(not(feature = "local_fs"), allow(clippy::unnecessary_lazy_evaluations))]
     pub fn current_git_branch(&self, ctx: &AppContext) -> Option<String> {
+        #[cfg(feature = "local_fs")]
+        {
+            if let Some(branch) = self
+                .cli_agent_git_status_metadata(ctx)
+                .map(|metadata| metadata.current_branch_name.clone())
+                .filter(|branch| !branch.trim().is_empty())
+            {
+                return Some(branch);
+            }
+        }
+
         self.prompt_chip_value(&ContextChipKind::ShellGitBranch, ctx)
             .or_else(|| {
                 #[cfg(feature = "local_fs")]
